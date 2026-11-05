@@ -1,0 +1,10 @@
+.env
+.venv
+.git
+logs
+**/__pycache__
+**/*.pyc
+tests
+docker-compose.yml
+litellm-config.yaml
+README.md

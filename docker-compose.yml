@@ -1,0 +1,323 @@
+name: wedding_planner
+
+# ---------------------------------------------------------------------------
+# Shared settings
+# ---------------------------------------------------------------------------
+x-app-env: &app-env
+  REDIS_URL: redis://redis:${REDIS_CONTAINER_PORT}/0
+  DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:${POSTGRES_CONTAINER_PORT}/${POSTGRES_DB}
+  # Telemetry -> Langfuse v3 (the SDK is OpenTelemetry-based)
+  LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+  LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+  LANGFUSE_HOST: http://langfuse:3000
+  LANGFUSE_BASE_URL: http://langfuse:3000
+
+x-langfuse-env: &langfuse-env
+  DATABASE_URL: postgresql://${LANGFUSE_POSTGRES_USER}:${LANGFUSE_POSTGRES_PASSWORD}@langfuse_postgres:${LANGFUSE_POSTGRES_CONTAINER_PORT}/${LANGFUSE_POSTGRES_DB}
+  SALT: ${LANGFUSE_SALT}
+  ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY}
+  TELEMETRY_ENABLED: "false"
+  NEXTAUTH_URL: http://localhost:${LANGFUSE_PORT}
+  NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+  CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse_clickhouse:9000
+  CLICKHOUSE_URL: http://langfuse_clickhouse:8123
+  CLICKHOUSE_USER: clickhouse
+  CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+  REDIS_HOST: langfuse_redis
+  REDIS_PORT: "6379"
+  REDIS_AUTH: ${LANGFUSE_REDIS_AUTH}
+  REDIS_TLS_ENABLED: "false"
+  LANGFUSE_USE_AZURE_BLOB: "false"
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+
+services:
+  # =========================================================================
+  # A. APPLICATION
+  # =========================================================================
+
+  # 1. FastAPI gateway: JWT auth, payload sanitisation, instant run tokens. Never runs the agent.
+  web_api:
+    build: .
+    container_name: agent_web_api
+    command: uvicorn api:app --host 0.0.0.0 --port ${WEB_API_CONTAINER_PORT}
+    ports:
+      - "127.0.0.1:${WEB_API_HOST_PORT}:${WEB_API_CONTAINER_PORT}"
+    environment:
+      # Least privilege: the gateway only needs Redis. No database, model or telemetry credentials.
+      REDIS_URL: redis://redis:${REDIS_CONTAINER_PORT}/0
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_MIN: ${JWT_EXPIRES_MIN:-60}
+      API_USERNAME: ${API_USERNAME}
+      API_PASSWORD: ${API_PASSWORD}
+      RUNS_PER_MINUTE: ${RUNS_PER_MINUTE:-10}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:${WEB_API_CONTAINER_PORT}/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      redis:
+        condition: service_healthy
+    mem_limit: 512m
+    restart: unless-stopped
+
+  # 2. Celery worker: runs the LangGraph workflow (queue `runs`) and DeepEval jobs (queue `evals`).
+  celery_worker:
+    build: .
+    container_name: agent_celery_worker
+    command: celery -A tasks.celery_app worker --loglevel=info -Q runs,evals --concurrency=${WORKER_CONCURRENCY:-2}
+    environment:
+      <<: *app-env
+      # All model traffic goes through the gateway using the budget-capped virtual key.
+      # The worker never sees the Anthropic API key.
+      LITELLM_BASE_URL: http://litellm_proxy:${LITELLM_CONTAINER_PORT}
+      LITELLM_API_KEY: ${LITELLM_WORKER_KEY}
+      LITELLM_MODEL: claude-haiku
+      TAVILY_API_KEY: ${TAVILY_API_KEY:-}
+      DEEPEVAL_TELEMETRY_OPT_OUT: "YES"
+      TASK_MAX_RETRIES: ${TASK_MAX_RETRIES:-3}
+      CHINOOK_DB_PATH: /app/resources/Chinook.db
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      litellm_init:
+        condition: service_completed_successfully
+    mem_limit: 2g              # hard memory ceiling for the whole worker container
+    restart: unless-stopped
+
+  # 3. Broker + run-state store
+  redis:
+    image: redis:7-alpine
+    container_name: agent_redis
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT}:${REDIS_CONTAINER_PORT}"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # 4. LangGraph checkpoints (durable state for crash recovery)
+  postgres:
+    image: postgres:16-alpine
+    container_name: agent_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT}:${POSTGRES_CONTAINER_PORT}"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # =========================================================================
+  # B. LITELLM GATEWAY (fiscal proxy)
+  # =========================================================================
+  litellm_postgres:
+    image: postgres:16-alpine
+    container_name: litellm_postgres
+    environment:
+      POSTGRES_USER: ${LITELLM_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${LITELLM_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${LITELLM_POSTGRES_DB}
+    volumes:
+      - litellm_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${LITELLM_POSTGRES_USER} -d ${LITELLM_POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  litellm_proxy:
+    image: ghcr.io/berriai/litellm-database:main-stable
+    container_name: litellm_proxy
+    command: ["--config", "/app/config.yaml", "--port", "${LITELLM_CONTAINER_PORT}"]
+    ports:
+      - "127.0.0.1:${LITELLM_HOST_PORT}:${LITELLM_CONTAINER_PORT}"
+    volumes:
+      - ./litellm-config.yaml:/app/config.yaml:ro
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      DATABASE_URL: postgresql://${LITELLM_POSTGRES_USER}:${LITELLM_POSTGRES_PASSWORD}@litellm_postgres:5432/${LITELLM_POSTGRES_DB}
+    depends_on:
+      litellm_postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # One-shot job: waits for the proxy, then creates (or updates) the worker's virtual key with
+  # its spend ceiling and rate limits. Fails loudly if the key does not exist afterwards, which
+  # keeps the worker from starting without a budget guard.
+  litellm_init:
+    image: curlimages/curl:8.10.1
+    container_name: litellm_init
+    depends_on:
+      - litellm_proxy
+    environment:
+      PORT: ${LITELLM_CONTAINER_PORT}
+      MASTER: ${LITELLM_MASTER_KEY}
+      WORKER_KEY: ${LITELLM_WORKER_KEY}
+      MAX_BUDGET: ${LITELLM_MAX_BUDGET:-10}
+      BUDGET_DURATION: ${LITELLM_BUDGET_DURATION:-30d}
+      TPM: ${LITELLM_TPM_LIMIT:-100000}
+      RPM: ${LITELLM_RPM_LIMIT:-500}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        BASE="http://litellm_proxy:$$PORT"
+        for i in $$(seq 1 60); do curl -fsS "$$BASE/health/liveliness" >/dev/null 2>&1 && break; echo "waiting for litellm ($$i/60)..."; sleep 3; done
+        curl -fsS "$$BASE/health/liveliness" >/dev/null || { echo "litellm never became healthy - check: docker compose logs litellm_proxy"; exit 1; }
+        BODY="{\"key\":\"$$WORKER_KEY\",\"key_alias\":\"celery-worker\",\"models\":[\"claude-haiku\"],\"max_budget\":$$MAX_BUDGET,\"budget_duration\":\"$$BUDGET_DURATION\",\"tpm_limit\":$$TPM,\"rpm_limit\":$$RPM}"
+        if curl -fsS "$$BASE/key/info?key=$$WORKER_KEY" -H "Authorization: Bearer $$MASTER" >/dev/null 2>&1; then
+          echo "worker key exists - re-applying budget and rate limits"
+          ACTION=update
+        else
+          echo "creating worker key"
+          ACTION=generate
+        fi
+        curl -fsS -X POST "$$BASE/key/$$ACTION" -H "Authorization: Bearer $$MASTER" -H "Content-Type: application/json" -d "$$BODY" >/dev/null || { echo "key $$ACTION failed"; exit 1; }
+        curl -fsS "$$BASE/key/info?key=$$WORKER_KEY" -H "Authorization: Bearer $$MASTER" >/dev/null && echo "worker key ready (budget $$MAX_BUDGET per $$BUDGET_DURATION, $$RPM req/min, $$TPM tokens/min)"
+
+  # =========================================================================
+  # C. LANGFUSE v3 (OpenTelemetry-based tracing)
+  # =========================================================================
+  langfuse:
+    image: langfuse/langfuse:3
+    container_name: langfuse_server
+    ports:
+      - "127.0.0.1:${LANGFUSE_PORT}:3000"
+    environment:
+      <<: *langfuse-env
+      AUTH_DISABLE_SIGNUP: "true"
+      # Headless bootstrap so the keys in .env work immediately:
+      LANGFUSE_INIT_ORG_ID: wedding-org
+      LANGFUSE_INIT_ORG_NAME: Wedding Planner
+      LANGFUSE_INIT_PROJECT_ID: wedding-planner
+      LANGFUSE_INIT_PROJECT_NAME: wedding-planner
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL}
+      LANGFUSE_INIT_USER_NAME: admin
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD}
+    depends_on: &langfuse-deps
+      langfuse_postgres:
+        condition: service_healthy
+      langfuse_clickhouse:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+      langfuse_redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  langfuse_worker:
+    image: langfuse/langfuse-worker:3
+    container_name: langfuse_worker
+    environment:
+      <<: *langfuse-env
+    depends_on: *langfuse-deps
+    restart: unless-stopped
+
+  langfuse_postgres:
+    image: postgres:16-alpine
+    container_name: langfuse_postgres
+    environment:
+      POSTGRES_USER: ${LANGFUSE_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${LANGFUSE_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${LANGFUSE_POSTGRES_DB}
+    ports:
+      - "127.0.0.1:${LANGFUSE_POSTGRES_HOST_PORT}:${LANGFUSE_POSTGRES_CONTAINER_PORT}"
+    volumes:
+      - langfuse_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${LANGFUSE_POSTGRES_USER} -d ${LANGFUSE_POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  langfuse_clickhouse:
+    image: clickhouse/clickhouse-server:24.12
+    container_name: langfuse_clickhouse
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # NOTE: hyphen, not underscore. MinIO rejects hostnames containing '_' ("invalid hostname"),
+  # and Langfuse reaches it by this name.
+  langfuse-minio:
+    image: cgr.dev/chainguard/minio
+    container_name: langfuse-minio
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  langfuse_redis:
+    image: redis:7-alpine
+    container_name: langfuse_redis
+    command: ["redis-server", "--requirepass", "${LANGFUSE_REDIS_AUTH}", "--maxmemory-policy", "noeviction"]
+    environment:
+      REDISCLI_AUTH: ${LANGFUSE_REDIS_AUTH}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  pgdata:
+  litellm_pgdata:
+  langfuse_pgdata:
+  langfuse_clickhouse_data:
+  langfuse_clickhouse_logs:
+  langfuse_minio_data:

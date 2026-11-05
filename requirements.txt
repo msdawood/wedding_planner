@@ -1,0 +1,28 @@
+# --- agent core ---
+langchain>=1.4,<2
+langchain-core>=1.7,<2
+langchain-anthropic>=1.7,<2
+langchain-openai>=1.7,<2          # talks to the LiteLLM gateway (OpenAI-compatible API)
+langchain-community>=0.4,<0.5
+langchain-mcp-adapters>=0.3,<0.4
+langchain-tavily>=0.2,<0.3
+tavily-python>=0.8,<0.9
+langgraph>=1.2,<2
+langgraph-checkpoint-postgres>=3.2,<4
+psycopg[binary,pool]>=3.3,<4
+python-dotenv>=1.2
+
+# --- gateway ---
+fastapi>=0.162,<1
+uvicorn[standard]>=0.54,<1
+python-multipart>=0.0.33         # OAuth2 password form on /auth/token
+PyJWT>=2.15,<3
+redis>=6.4,<7
+
+# --- workers ---
+celery[redis]>=5.6,<6
+
+# --- evaluation & observability ---
+deepeval>=4.3,<5
+# SDK v4 works with a self-hosted Langfuse *server v3* (>= 3.63). SDK v5 requires server v4 (>= 4.59).
+langfuse>=4.18,<5
