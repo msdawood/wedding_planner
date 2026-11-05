@@ -77,3 +77,6 @@ python -m pytest tests -q          # unit + API tests; integration tests need Po
 
 ## Local development without Docker
 `python src/wedding_graph.py` (run from the project folder) still works with just `ANTHROPIC_API_KEY`; with `LITELLM_BASE_URL` unset it calls Anthropic directly.
+
+## Acknowledgements
+Based on the wedding planner multi-agent project from [Introduction to LangChain - Python](https://academy.langchain.com/courses/foundation-introduction-to-langchain-python), converted to LangGraph and extended with a FastAPI gateway, Celery workers, LiteLLM, DeepEval and Langfuse.
