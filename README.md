@@ -67,6 +67,14 @@ This is a working reference stack, not a hardened product. Know these before rel
 * **Local-only defaults.** Services bind to `127.0.0.1`, there is no TLS, and the compose file is not a deployment recipe.
 * **Several tuning values are hard-coded.** Injection-filter regexes and prompts live in the source and are not yet configurable.
 
+## Acknowledgements
+
+Based on the wedding planner multi-agent example from LangChain Academy
+([langchain-ai/lca-lc-foundations](https://github.com/langchain-ai/lca-lc-foundations), MIT licensed),
+converted to LangGraph and extended with a FastAPI gateway, Celery workers, a LiteLLM spend gateway,
+DeepEval metrics and Langfuse tracing. The sample music data is the
+[Chinook database](https://github.com/lerocha/chinook-database). See `THIRD_PARTY_NOTICES.md`.
+
 ## Tests
 
 ```bash
@@ -77,6 +85,3 @@ python -m pytest tests -q          # unit + API tests; integration tests need Po
 
 ## Local development without Docker
 `python src/wedding_graph.py` (run from the project folder) still works with just `ANTHROPIC_API_KEY`; with `LITELLM_BASE_URL` unset it calls Anthropic directly.
-
-## Acknowledgements
-Based on the wedding planner multi-agent project from [Introduction to LangChain - Python](https://academy.langchain.com/courses/foundation-introduction-to-langchain-python), converted to LangGraph and extended with a FastAPI gateway, Celery workers, LiteLLM, DeepEval and Langfuse.
